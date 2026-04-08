@@ -25,11 +25,15 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
  * A method handler that creates and manages an [MethodChannel] for freeRASP methods.
  */
 internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
+
     private var context: Context? = null
     private var methodChannel: MethodChannel? = null
     private var talsecPigeon: TalsecPigeonApi? = null
-    private val backgroundHandlerThread = HandlerThread("BackgroundThread").apply { start() }
-    private val backgroundHandler = Handler(backgroundHandlerThread.looper)
+
+    // ✅ 使用懒加载，避免线程复用问题
+    private var backgroundHandlerThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     internal var activity: Activity? = null
@@ -38,17 +42,42 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
         private const val CHANNEL_NAME: String = "talsec.app/freerasp/methods"
     }
 
+    // ✅ 确保后台线程存在
+    private fun ensureBackgroundHandler() {
+        if (backgroundHandlerThread == null || !backgroundHandlerThread!!.isAlive) {
+            backgroundHandlerThread =
+                HandlerThread("BackgroundThread").apply { start() }
+            backgroundHandler = Handler(backgroundHandlerThread!!.looper)
+        }
+    }
+
     private val sink = object : MethodSink {
         override fun onMalwareDetected(packageInfo: List<SuspiciousAppInfo>) {
-            context?.let { context ->
-                val pigeonPackageInfo = packageInfo.map { it.toPigeon(context) }
-                talsecPigeon?.onMalwareDetected(pigeonPackageInfo) { result ->
-                    // Parse the result (which is Unit so we can ignore it) or throw an exception
-                    // Exceptions are translated to Flutter errors automatically
-                    result.getOrElse {
-                        Log.e("MethodCallHandlerSink", "Result ended with failure")
-                        throw it
+            val ctx = context?.applicationContext ?: return
+
+            ensureBackgroundHandler()
+
+            backgroundHandler?.post {
+                try {
+                    val pigeonPackageInfo = packageInfo.map { it.toPigeon(ctx) }
+
+                    mainHandler.post {
+                        talsecPigeon?.onMalwareDetected(pigeonPackageInfo) { result ->
+                            result.getOrElse {
+                                Log.e(
+                                    "MethodCallHandlerSink",
+                                    "Result ended with failure",
+                                    it
+                                )
+                            }
+                        }
                     }
+                } catch (e: Exception) {
+                    Log.e(
+                        "MethodCallHandlerSink",
+                        "Error processing malware detection",
+                        e
+                    )
                 }
             }
         }
@@ -68,7 +97,10 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
      */
     fun createMethodChannel(messenger: BinaryMessenger, context: Context) {
         methodChannel?.let {
-            Log.i("MethodCallHandler", "Tried to create channel without disposing old one.")
+            Log.i(
+                "MethodCallHandler",
+                "Tried to create channel without disposing old one."
+            )
             destroyMethodChannel()
         }
 
@@ -78,6 +110,8 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
 
         this.context = context
         this.talsecPigeon = TalsecPigeonApi(messenger)
+
+        ensureBackgroundHandler()
 
         TalsecThreatHandler.attachMethodSink(sink)
     }
@@ -93,20 +127,17 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
         this.talsecPigeon = null
 
         TalsecThreatHandler.detachMethodSink()
+
+        backgroundHandlerThread?.quitSafely()
+        backgroundHandlerThread = null
+        backgroundHandler = null
     }
 
-    override fun onStateChanged(source: LifecycleOwner, event: Lifecycle.Event) {
-        when (event) {
-            Lifecycle.Event.ON_DESTROY -> {
-                context?.let {
-                    backgroundHandlerThread.quitSafely()
-                }
-            }
-
-            else -> {
-                // Nothing to do
-            }
-        }
+    override fun onStateChanged(
+        source: LifecycleOwner,
+        event: Lifecycle.Event
+    ) {
+        // ❌ 不再在这里释放线程，避免重复释放问题
     }
 
     /**
@@ -126,6 +157,7 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
             "removeExternalId" -> removeExternalId(result)
             else -> result.notImplemented()
         }
+
     }
 
     /**
@@ -140,7 +172,8 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
             val talsecConfig = Utils.toTalsecConfigThrowing(config)
             context?.let {
                 TalsecThreatHandler.start(it, talsecConfig)
-            } ?: throw IllegalStateException("Unable to run Talsec - context is null")
+            }
+                ?: throw IllegalStateException("Unable to run Talsec - context is null")
             result.success(null)
         }
     }
@@ -152,7 +185,8 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
                 if (packageName != null) {
                     Talsec.addToWhitelist(it, packageName)
                 }
-            } ?: throw IllegalStateException("Unable to add package to whitelist - context is null")
+            }
+                ?: throw IllegalStateException("Unable to add package to whitelist - context is null")
             result.success(null)
         }
     }
@@ -168,7 +202,7 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
             val packageName = call.argument<String>("packageName")
                 ?: throw NullPointerException("Package name cannot be null.")
 
-            backgroundHandler.post {
+            backgroundHandler?.post {
                 context?.let {
                     val appIcon = Utils.parseIconBase64(it, packageName)
                     mainHandler.post { result.success(appIcon) }
@@ -184,9 +218,13 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
      * @param call The method call containing the enable flag.
      * @param result The result handler of the method call.
      */
-    private fun blockScreenCapture(call: MethodCall, result: MethodChannel.Result) {
+    private fun blockScreenCapture(
+        call: MethodCall,
+        result: MethodChannel.Result
+    ) {
         runResultCatching(result) {
-            val enable = call.argument<Boolean>("enable") ?: throw NullPointerException("Enable flag cannot be null.")
+            val enable = call.argument<Boolean>("enable")
+                ?: throw NullPointerException("Enable flag cannot be null.")
             activity?.let {
                 Talsec.blockScreenCapture(it, enable)
                 result.success(null)
@@ -213,10 +251,16 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
      * @param call The method call containing the external ID.
      * @param result The result handler of the method call.
      */
-    private fun storeExternalId(call: MethodCall, result: MethodChannel.Result) {
+    private fun storeExternalId(
+        call: MethodCall,
+        result: MethodChannel.Result
+    ) {
         runResultCatching(result) {
             context?.let {
-                val data = call.argument<String>("data") ?: throw NullPointerException("External ID data cannot be null.")
+                val data =
+                    call.argument<String>("data") ?: throw NullPointerException(
+                        "External ID data cannot be null."
+                    )
                 Talsec.storeExternalId(it, data).resolve(result)
                 return@runResultCatching
             }
@@ -239,4 +283,5 @@ internal class MethodCallHandler : MethodCallHandler, LifecycleEventObserver {
             throw IllegalStateException("Unable to remove external ID - context is null")
         }
     }
+
 }
